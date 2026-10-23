@@ -1,0 +1,117 @@
+name: GMI AppSec Gate
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appsec-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    name: GMI AppSec / Trivy
+    runs-on: [self-hosted, appsec, trivy]
+    timeout-minutes: 20
+
+    env:
+      TRIVY_CACHE_DIR: /var/lib/trivy-cache
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Reports this PR's scan into the same Elastic streams (gmi-appsec-scans/
+      # gmi-appsec-findings) that the push/schedule-triggered gmi-appsec.yml
+      # feeds, so the AppSec dashboard reflects fixes as soon as a PR is open
+      # instead of only after merge + the next scheduled scan. gmi-appsec-ci
+      # only *writes* a new baseline under --baseline (used by gmi-appsec.yml
+      # on push to the default branch); without that flag it just compares
+      # this checkout against the existing baseline and reports the delta, so
+      # running it here on a PR branch cannot corrupt the baseline the real
+      # gate compares against. continue-on-error because this is reporting,
+      # not gating -- the trivy fs step below is the actual PR gate.
+      - name: Report scan to AppSec dashboard
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v gmi-appsec-ci >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8089/healthz 2>/dev/null | jq -e '.status == "ok"' >/dev/null 2>&1; then
+            gmi-appsec-ci "$GITHUB_WORKSPACE" "$GITHUB_REPOSITORY"
+          else
+            echo "gmi-appsec-ci unavailable on this runner -- skipping the Elastic report for this PR scan (push/schedule scans are unaffected)."
+          fi
+
+      # Trivy writes SARIF locally for log annotations; upload is disabled
+      # until this repo has the required code-scanning permissions.
+      - name: Block vulnerable or misconfigured code
+        run: |
+          trivy fs \
+            --scanners vuln,misconfig \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output trivy-vuln-misconfig.sarif \
+            --exit-code 1 \
+            --timeout 15m \
+            .
+
+      # SARIF has no human-readable log output, and on private repos in
+      # this org SARIF upload is not authorized; log annotations provide detail.
+      # Always runs so findings print whether the scan passed or failed.
+      - name: Print vulnerability/misconfig findings to the log
+        if: always()
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('trivy-vuln-misconfig.sarif'))
+          found = False
+          for run in d.get('runs', []):
+              rules = {r['id']: r for r in run.get('tool', {}).get('driver', {}).get('rules', [])}
+              for res in run.get('results', []):
+                  found = True
+                  rule = rules.get(res.get('ruleId'), {})
+                  sev = rule.get('properties', {}).get('security-severity', '?')
+                  loc = res.get('locations', [{}])[0].get('physicalLocation', {})
+                  path = loc.get('artifactLocation', {}).get('uri', '?')
+                  line = loc.get('region', {}).get('startLine', '?')
+                  msg = res.get('message', {}).get('text', '').replace(chr(10), ' ')
+                  print(f\"::error file={path},line={line},title={res.get('ruleId')} (severity {sev})::{msg}\")
+          if not found:
+              print('No vulnerability/misconfig findings.')
+          "
+
+      - name: Block detected secrets
+        if: always()
+        run: |
+          trivy fs \
+            --scanners secret \
+            --format sarif \
+            --output trivy-secrets.sarif \
+            --exit-code 1 \
+            --timeout 15m \
+            .
+
+      - name: Print secret findings to the log
+        if: always()
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('trivy-secrets.sarif'))
+          found = False
+          for run in d.get('runs', []):
+              for res in run.get('results', []):
+                  found = True
+                  loc = res.get('locations', [{}])[0].get('physicalLocation', {})
+                  path = loc.get('artifactLocation', {}).get('uri', '?')
+                  line = loc.get('region', {}).get('startLine', '?')
+                  msg = res.get('message', {}).get('text', '').replace(chr(10), ' ')
+                  print(f\"::error file={path},line={line},title={res.get('ruleId')}::{msg}\")
+          if not found:
+              print('No secret findings.')
+          "
+
